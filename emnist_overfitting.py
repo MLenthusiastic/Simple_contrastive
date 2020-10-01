@@ -30,14 +30,16 @@ parser.add_argument('--dataset', type=str, default='EMNIST')
 parser.add_argument('--dataset_train_split', type=float, default=0.6)
 parser.add_argument('--no_projector_samples_per_class', type=int, default=100)
 parser.add_argument('--projector_img_size', type=int, default=32)
-parser.add_argument('--data_expansion_factor', type=int, default=0.6)
+parser.add_argument('--data_expansion_factor', type=int, default=0.2)
 parser.add_argument('--mode', type=str, default='train')
-parser.add_argument('--device', type=str, default='cuda')
+parser.add_argument('--device', type=str, default='cpu')
 args, unknown = parser.parse_known_args()
 
 DEVICE = args.device
 if not torch.cuda.is_available():
     DEVICE = 'cpu'
+
+print(DEVICE)
 
 accuracy_calculating = True
 
@@ -48,8 +50,8 @@ class SiameseMNIST(Dataset):
         self.data_labels = list(self.data_dict.keys())
         self.data_transforms = transforms.Compose([transforms.ToTensor()])
 
-        positive_pairs = []  # 0
-        negative_pairs = []  # 1
+        positive_pairs = []  # 0 same
+        negative_pairs = []  # 1 different
 
         ## datastructure [ img1, img2, target, label1, label2]
         for label in self.data_labels:
@@ -141,7 +143,7 @@ print('train set length ', len(train_dataset))
 
 model = torchvision.models.alexnet(pretrained=True)
 
-model.features=nn.Sequential(
+model.features = nn.Sequential(
     nn.Upsample(scale_factor=8, mode='nearest'), #to match with Alexnet Structure 28px --> 224px
     nn.Conv2d(1, 64, kernel_size=(11, 11), stride=(4, 4), padding=(2, 2)),
     nn.ReLU(inplace=True),
@@ -196,7 +198,7 @@ for epoch in range(1, args.num_epochs + 1):
 
         model.train()
         torch.set_grad_enabled(True)
-
+        
         for batch in dataloader:
 
             img1, img2, target, label1, label2 = batch
@@ -241,7 +243,7 @@ for epoch in range(1, args.num_epochs + 1):
         if dataloader == train_loader:
             train_losses.append(np.mean(losses))
             train_time_end = time.time()
-            print('epoch', epoch, 'train_loss', np.mean(losses), ' elapsed time', (train_time_end-train_start_time ), ' seconds' )
+            print('epoch', epoch, 'train_loss', np.mean(losses), ' elapsed time', (train_time_end-train_start_time ), ' seconds')
             tb_writer.add_scalars(tag_scalar_dict={'Train': np.mean(losses)}, global_step=epoch,
                                   main_tag='Loss')
             tb_writer.add_embedding(
@@ -251,10 +253,10 @@ for epoch in range(1, args.num_epochs + 1):
                 global_step=epoch, tag=f'train_emb_{epoch}')
             tb_writer.flush()
 
-    torch.save(model, 'emnist_overfitted.pth')
+    torch.save(model, 'emnist_overfitted_old.pth')
 
     if accuracy_calculating:
-        model = torch.load('emnist_overfitted.pth')
+        model = torch.load('emnist_overfitted_old.pth')
 
         model = model.to(DEVICE)
         model.eval()
@@ -267,6 +269,7 @@ for epoch in range(1, args.num_epochs + 1):
 
             embbedding_dict = {}
             embbedding_center_dict = {}
+            batch_accuracy_list = []
 
             ##center calculation
             for batch in dataloader:
@@ -279,57 +282,46 @@ for epoch in range(1, args.num_epochs + 1):
                 out2 = model(img2)
 
                 ##collecting all embedding for each label
-                for index, (label1, label2) in enumerate(zip(label1.numpy(), label2.numpy())):
-                    if label1 in embbedding_dict.keys():
-                        existing_emb_for_label = embbedding_dict.get(label1)
+                for index, (label1_np, label2_np) in enumerate(zip(label1.numpy(), label2.numpy())):
+                    if label1_np in embbedding_dict.keys():
+                        existing_emb_for_label = embbedding_dict.get(label1_np)
                         existing_emb_for_label.append(out1[index].data[:])
                     else:
-                        embbedding_dict[label1] = [out1[index].data[:]]
-                    if label2 in embbedding_dict.keys():
-                        existing_emb_for_label = embbedding_dict.get(label2)
+                        embbedding_dict[label1_np] = [out1[index].data[:]]
+                    if label2_np in embbedding_dict.keys():
+                        existing_emb_for_label = embbedding_dict.get(label2_np)
                         existing_emb_for_label.append(out2[index].data[:])
                     else:
-                        embbedding_dict[label2] = [out2[index].data[:]]
+                        embbedding_dict[label2_np] = [out2[index].data[:]]
 
+                ##calculate center for each label
+                for label in embbedding_dict.keys():
+                    embeddings = embbedding_dict.get(label)
+                    embbedding_center_dict[label] = torch.mean(torch.stack(embeddings), dim=0)
 
-            ##calculate center for each label
-            for label in embbedding_dict.keys():
-                embeddings = embbedding_dict.get(label)
-                embbedding_center_dict[label] = torch.mean(torch.stack(embeddings))
+                keys_ascending = list(embbedding_center_dict.keys())
+                keys_ascending.sort()
 
-            print(embbedding_center_dict)
+                all_centers_ascending = [embbedding_center_dict[label] for label in keys_ascending]
 
-            batch_accuracy = []
+                batch_accuracy = 0
+                for single_out1, single_out2, single_target in zip(out1, out2, target):
+                    dists_single_out1 = torch.pairwise_distance(torch.stack(all_centers_ascending),
+                                                torch.stack(len(all_centers_ascending) * [single_out1]), p=2)
+                    closest_idx_1 = torch.argmin(dists_single_out1)
 
-            ##accuracy calculation
-            for batch in dataloader:
-                img1, img2, target, label1, label2 = batch
+                    dists_single_out2 = torch.pairwise_distance(torch.stack(all_centers_ascending),
+                                                                torch.stack(len(all_centers_ascending) * [single_out2]),
+                                                                p=2)
+                    closest_idx_2 = torch.argmin(dists_single_out2)
 
-                img1 = img1.to(DEVICE)
-                img2 = img2.to(DEVICE)
+                    if torch.eq(closest_idx_1, closest_idx_2) and single_target.item() == 0:
+                        batch_accuracy += 1
+                    elif not torch.eq(closest_idx_1, closest_idx_2) and single_target.item() == 1:
+                        batch_accuracy += 1
 
-                out1 = model(img1)
-                out2 = model(img2)
-
-                accuracy = 0
-
-                for s_out1, s_out2, s_target, s_label1, s_label2 in zip(out1, out2, target, label1, label2):
-
-                    center_labels = np.array(list(embbedding_center_dict.keys()))
-                    center_values = [embbedding_center_dict.get(label) for label in center_labels]
-
-                    out1_distances = [abs(center - torch.mean(s_out1.data[:])) for center in center_values]
-                    out1_closest_label = center_labels[out1_distances.index(min(out1_distances))]
-
-
-                    out2_distances = [abs(center - torch.mean(s_out2.data[:])) for center in center_values]
-                    out2_closest_label = center_labels[out2_distances.index(min(out2_distances))]
-
-                    if (((out1_closest_label == out2_closest_label) and s_target == 0) or
-                            ((out1_closest_label != out2_closest_label) and s_target == 1)):
-                        accuracy = accuracy + 1
-
-                batch_accuracy.append(accuracy/args.batch_size)
+                #print('batch accuracy', batch_accuracy/args.batch_size)
+                batch_accuracy_list.append(batch_accuracy/args.batch_size)
 
                 ##Adding Tensorboard Projector
                 labels_total = torch.cat((label1, label2), dim=0)
@@ -354,9 +346,10 @@ for epoch in range(1, args.num_epochs + 1):
             # epoch accuracy
             if dataloader == train_loader:
                 test_end_time = time.time()
-                print('train epoch acc', epoch, np.mean(batch_accuracy)*100, ' elapsed time', (test_end_time - test_start_time ), ' seconds' )
-                train_accuracy.append(np.mean(batch_accuracy) * 100)
-                tb_writer.add_scalars(tag_scalar_dict={'Train': (np.mean(batch_accuracy) * 100)}, global_step=epoch,
+                print('train epoch acc', epoch, np.mean(batch_accuracy_list) * 100, ' elapsed time',
+                      (test_end_time - test_start_time), ' seconds')
+                train_accuracy.append(np.mean(batch_accuracy_list) * 100)
+                tb_writer.add_scalars(tag_scalar_dict={'Train': (np.mean(batch_accuracy_list) * 100)}, global_step=epoch,
                                       main_tag='Accuracy')
 
                 tb_writer.add_embedding(
@@ -365,7 +358,4 @@ for epoch in range(1, args.num_epochs + 1):
                     metadata=projector_labels,
                     global_step=epoch, tag=f'test_emb_{epoch}')
                 tb_writer.flush()
-
-
-
 
